@@ -1,0 +1,97 @@
+name: MLOps CI/CD
+
+on:
+  push:
+    branches: [mlops-lab-e2e]
+  pull_request:
+    branches: [mlops-lab-e2e]
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: mlops-lab-api
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Lint
+        run: pip install flake8 && flake8 src api --max-line-length=100 --extend-ignore=E203
+      - name: Run tests
+        run: pytest tests/ -v
+
+  train_and_gate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Generate dataset
+        run: python data/generate_data.py --out data/churn.csv --rows 8000
+      - name: Train
+        working-directory: src
+        run: python train.py --data ../data/churn.csv --register
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+      - name: Quality gate
+        working-directory: src
+        run: python evaluate.py --metrics artifacts/metrics.json --min-f1 0.70 --min-auc 0.75
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: src/artifacts/
+
+  build_and_deploy:
+    needs: train_and_gate
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/mlops-lab-e2e'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+          path: artifacts
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $REGISTRY/$ECR_REPOSITORY:latest
+          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $REGISTRY/$ECR_REPOSITORY:latest
+      - name: Deploy to EC2 over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS --password-stdin ${{ steps.ecr-login.outputs.registry }}
+            docker pull ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            docker stop churn-api || true
+            docker rm churn-api || true
+            docker run -d --name churn-api --restart always \
+              -p 8000:8000 \
+              -e MLFLOW_TRACKING_URI=http://localhost:5000 \
+              -e MODEL_URI=models:/churn-classifier/Production \
+              ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
