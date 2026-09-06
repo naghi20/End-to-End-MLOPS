@@ -12,4 +12,4 @@
 
 ## Full AWS lab
 
-See the accompanying lab guide document for the six-session walkthrough.
+See the accompanying lab guide document for the six-session walkthrough AWS_CloudShell_Infra_MLflow_Runbook.pdf
